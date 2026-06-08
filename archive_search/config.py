@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_ATTACHMENT_DIR = "data/attachments"
 
 
 def load_env(path: Path | None = None) -> None:
@@ -34,6 +35,13 @@ class Settings:
     typesense_url: str = "http://127.0.0.1:8108"
     typesense_api_key: str = ""
     typesense_collection: str = "freshdesk_tickets"
+    typesense_chunk_collection: str = "freshdesk_ticket_chunks"
+    typesense_embedding_model: str = "ts/all-MiniLM-L12-v2"
+    typesense_vector_alpha: float = 0.35
+    typesense_vector_k: int = 200
+    typesense_chunk_chars: int = 2000
+    typesense_chunk_overlap: int = 200
+    attachment_dir: str = DEFAULT_ATTACHMENT_DIR
     search_backend: str = "postgres"
 
 
@@ -51,6 +59,19 @@ def get_settings() -> Settings:
     typesense_url = os.environ.get("TYPESENSE_URL", "http://127.0.0.1:8108").strip()
     typesense_api_key = os.environ.get("TYPESENSE_API_KEY", "").strip()
     typesense_collection = os.environ.get("TYPESENSE_COLLECTION", "freshdesk_tickets").strip()
+    typesense_chunk_collection = os.environ.get(
+        "TYPESENSE_CHUNK_COLLECTION",
+        "freshdesk_ticket_chunks",
+    ).strip()
+    typesense_embedding_model = os.environ.get(
+        "TYPESENSE_EMBEDDING_MODEL",
+        "ts/all-MiniLM-L12-v2",
+    ).strip()
+    typesense_vector_alpha = float(os.environ.get("TYPESENSE_VECTOR_ALPHA", "0.35"))
+    typesense_vector_k = int(os.environ.get("TYPESENSE_VECTOR_K", "200"))
+    typesense_chunk_chars = int(os.environ.get("TYPESENSE_CHUNK_CHARS", "2000"))
+    typesense_chunk_overlap = int(os.environ.get("TYPESENSE_CHUNK_OVERLAP", "200"))
+    attachment_dir = os.environ.get("FRESHDESK_ATTACHMENT_DIR", DEFAULT_ATTACHMENT_DIR).strip()
     search_backend = os.environ.get("SEARCH_BACKEND", "postgres").strip().lower()
 
     missing = []
@@ -74,7 +95,16 @@ def get_settings() -> Settings:
         typesense_url=typesense_url,
         typesense_api_key=typesense_api_key,
         typesense_collection=typesense_collection,
-        search_backend=search_backend if search_backend in {"postgres", "typesense"} else "postgres",
+        typesense_chunk_collection=typesense_chunk_collection,
+        typesense_embedding_model=typesense_embedding_model,
+        typesense_vector_alpha=typesense_vector_alpha,
+        typesense_vector_k=typesense_vector_k,
+        typesense_chunk_chars=typesense_chunk_chars,
+        typesense_chunk_overlap=typesense_chunk_overlap,
+        attachment_dir=attachment_dir,
+        search_backend=search_backend
+        if search_backend in {"postgres", "typesense", "hybrid"}
+        else "postgres",
     )
 
 

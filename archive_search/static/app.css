@@ -188,7 +188,8 @@ mark {
 }
 
 .tag,
-.badge {
+.badge,
+.source-pill {
   display: inline-flex;
   align-items: center;
   min-height: 22px;
@@ -198,6 +199,11 @@ mark {
   color: #24584f;
   font-size: 12px;
   font-weight: 700;
+}
+
+.source-pill {
+  background: #eef1f6;
+  color: #415164;
 }
 
 .empty-state {
@@ -249,6 +255,42 @@ mark {
   overflow-wrap: anywhere;
 }
 
+.cid-placeholder {
+  color: var(--muted);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.cid-missing {
+  display: inline-flex;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #f2ece7;
+  color: #7d4d25;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.inline-image {
+  margin: 12px 0;
+}
+
+.inline-image img,
+.attachment-preview img {
+  display: block;
+  max-width: min(100%, 760px);
+  max-height: 520px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.inline-image figcaption {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .conversation {
   padding: 14px 0;
   border-top: 1px solid var(--line);
@@ -294,6 +336,27 @@ mark {
   font-size: 14px;
 }
 
+.attachment-previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 220px));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.attachment-preview {
+  display: grid;
+  gap: 6px;
+  color: #34414c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.attachment-preview img {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: contain;
+}
+
 .attachments ul {
   display: grid;
   gap: 6px;
@@ -304,7 +367,7 @@ mark {
 
 .attachments li {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 170px 90px;
+  grid-template-columns: minmax(0, 1fr) 170px 90px 96px;
   gap: 10px;
   color: #34414c;
   font-size: 13px;

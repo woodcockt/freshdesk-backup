@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 
 from archive_search.typesense_search import (
     _build_filter_by,
+    _fuse_ticket_rows,
     _hit_to_row,
+    row_to_chunk_documents,
     row_to_document,
 )
 
@@ -70,6 +72,46 @@ class TypesenseSearchTest(unittest.TestCase):
 
         self.assertEqual(row["freshdesk_id"], 123)
         self.assertEqual(row["excerpt"], "matched <<api>> text")
+
+    def test_row_to_chunk_documents_prefixes_metadata_and_uses_stable_ids(self):
+        row = {
+            "freshdesk_id": 123,
+            "subject": "API issue",
+            "description_text": "Description",
+            "product_label": "CENtree",
+            "tags": ["API"],
+            "status": 2,
+            "priority": 3,
+            "created_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
+            "updated_at": datetime(2024, 1, 2, tzinfo=timezone.utc),
+            "attachment_count": 2,
+            "search_text": "API issue\n\nCENtree\n\n" + " ".join(f"word{i}" for i in range(80)),
+        }
+
+        documents = row_to_chunk_documents(row, chunk_chars=300, chunk_overlap=40)
+
+        self.assertGreaterEqual(len(documents), 2)
+        self.assertEqual(documents[0]["id"], "123-0")
+        self.assertEqual(documents[0]["freshdesk_id"], 123)
+        self.assertIn("API issue", documents[0]["chunk_text"])
+        self.assertIn("CENtree", documents[0]["chunk_text"])
+
+    def test_fuse_ticket_rows_combines_keyword_and_semantic_ranks(self):
+        rows = _fuse_ticket_rows(
+            keyword_rows=[
+                {"freshdesk_id": 1, "subject": "first", "excerpt": "keyword"},
+                {"freshdesk_id": 2, "subject": "second", "excerpt": "keyword"},
+            ],
+            semantic_rows=[
+                {"freshdesk_id": 2, "subject": "second", "excerpt": "semantic"},
+                {"freshdesk_id": 3, "subject": "third", "excerpt": "semantic"},
+            ],
+            limit=3,
+        )
+
+        self.assertEqual(rows[0]["freshdesk_id"], 2)
+        self.assertEqual(rows[0]["match_source"], "keyword + semantic")
+        self.assertEqual({row["freshdesk_id"] for row in rows}, {1, 2, 3})
 
 
 if __name__ == "__main__":

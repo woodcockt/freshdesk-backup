@@ -3,14 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
+from .attachments import AttachmentDownloader
 from .config import get_settings
 from .db import Database
 from .freshdesk import FreshdeskClient
 from .redaction import Redactor
 from .sync import SyncService
-from .typesense_search import TypesenseClient, index_typesense
+from .typesense_search import TypesenseClient, index_typesense, index_typesense_chunks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument("--updated-from")
     search_parser.add_argument("--updated-to")
     search_parser.add_argument("--limit", type=int, default=10)
-    search_parser.add_argument("--backend", choices=["postgres", "typesense"], default=None)
+    search_parser.add_argument("--backend", choices=["postgres", "typesense", "hybrid"], default=None)
     search_parser.add_argument("--json", action="store_true", help="Emit JSON rows.")
 
     typesense_parser = subparsers.add_parser(
@@ -45,6 +47,29 @@ def main(argv: list[str] | None = None) -> int:
     typesense_parser.add_argument("--batch-size", type=int, default=500)
     typesense_parser.add_argument("--recreate", action="store_true")
 
+    vector_parser = subparsers.add_parser(
+        "index-typesense-vectors",
+        help="Build or refresh the Typesense semantic chunk index.",
+    )
+    vector_parser.add_argument("--batch-size", type=int, default=50)
+    vector_parser.add_argument("--recreate", action="store_true")
+    vector_parser.add_argument("--chunk-chars", type=int, default=None)
+    vector_parser.add_argument("--chunk-overlap", type=int, default=None)
+    vector_parser.add_argument("--max-tickets", type=int, help="Index only the first N tickets.")
+
+    attachment_parser = subparsers.add_parser(
+        "download-attachments",
+        help="Download Freshdesk attachment binaries into the local archive.",
+    )
+    attachment_parser.add_argument("--max-attachments", type=int, help="Stop after N attachments.")
+    attachment_parser.add_argument("--ticket-id", type=int, help="Download attachments for one ticket.")
+    attachment_parser.add_argument(
+        "--max-tickets",
+        type=int,
+        help="Download attachments for the first N archived tickets by Freshdesk ID.",
+    )
+    attachment_parser.add_argument("--force", action="store_true", help="Redownload existing files.")
+
     show_parser = subparsers.add_parser("show", help="Show one archived ticket.")
     show_parser.add_argument("ticket_id", type=int)
     show_parser.add_argument("--json", action="store_true", help="Emit JSON.")
@@ -52,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = subparsers.add_parser("serve", help="Run the local archive web UI.")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
-    serve_parser.add_argument("--backend", choices=["postgres", "typesense"], default=None)
+    serve_parser.add_argument("--backend", choices=["postgres", "typesense", "hybrid"], default=None)
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -85,7 +110,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "search":
         backend = args.backend or settings.search_backend
-        if backend == "typesense":
+        if backend == "hybrid":
+            result = _typesense(settings).hybrid_search(
+                args.query,
+                limit=args.limit,
+                product=args.product,
+                tags=args.tag,
+                status=args.status,
+                priority=args.priority,
+                created_from=args.created_from,
+                created_to=args.created_to,
+                updated_from=args.updated_from,
+                updated_to=args.updated_to,
+            )
+            rows = result.rows
+        elif backend == "typesense":
             result = _typesense(settings).search(
                 args.query,
                 limit=args.limit,
@@ -128,6 +167,48 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Indexed {imported} tickets into Typesense. Failed: {failed}")
         return 0
 
+    if args.command == "index-typesense-vectors":
+        imported, failed, ticket_count = index_typesense_chunks(
+            database,
+            _typesense(settings),
+            batch_size=args.batch_size,
+            recreate=args.recreate,
+            chunk_chars=args.chunk_chars or settings.typesense_chunk_chars,
+            chunk_overlap=args.chunk_overlap or settings.typesense_chunk_overlap,
+            max_tickets=args.max_tickets,
+        )
+        print(
+            f"Indexed {imported} semantic chunks from {ticket_count} tickets into Typesense. "
+            f"Failed: {failed}"
+        )
+        return 0
+
+    if args.command == "download-attachments":
+        if args.ticket_id is not None and args.max_tickets is not None:
+            parser.error("--ticket-id and --max-tickets cannot be used together.")
+        result = AttachmentDownloader(
+            FreshdeskClient(settings.freshdesk_domain, settings.freshdesk_api_key),
+            database,
+            Path(settings.attachment_dir),
+        ).run(
+            max_attachments=args.max_attachments,
+            ticket_id=args.ticket_id,
+            max_tickets=args.max_tickets,
+            force=args.force,
+        )
+        print(
+            f"Attachment metadata rows: {result.metadata_count}. "
+            f"Attempted {result.attempted}; downloaded {result.downloaded}; "
+            f"skipped {result.skipped}; failed {result.failed}; "
+            f"bytes {result.bytes_written}."
+        )
+        summary = database.get_attachment_summary()
+        print(
+            f"Archive totals: {summary['downloaded_count']}/{summary['attachment_count']} "
+            f"downloaded, {summary['pending_count']} pending, {summary['error_count']} errors."
+        )
+        return 0
+
     if args.command == "show":
         payload = database.show_ticket(args.ticket_id)
         if not payload:
@@ -147,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
             database,
             typesense=typesense,
             default_backend=args.backend or settings.search_backend,
+            attachment_root=Path(settings.attachment_dir),
             host=args.host,
             port=args.port,
         )
@@ -215,4 +297,8 @@ def _typesense(settings) -> TypesenseClient:
         settings.typesense_url,
         settings.typesense_api_key,
         settings.typesense_collection,
+        chunk_collection=settings.typesense_chunk_collection,
+        embedding_model=settings.typesense_embedding_model,
+        vector_alpha=settings.typesense_vector_alpha,
+        vector_k=settings.typesense_vector_k,
     )

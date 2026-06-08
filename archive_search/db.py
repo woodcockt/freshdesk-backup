@@ -199,6 +199,210 @@ class Database:
                     (ticket["freshdesk_id"], seen_conversation_ids),
                 )
 
+    def rebuild_attachment_metadata(
+        self,
+        ticket_id: int | None = None,
+        max_tickets: int | None = None,
+    ) -> int:
+        count = 0
+        filters = ["attachment_count > 0"]
+        params: list[Any] = []
+        if ticket_id is not None:
+            filters.append("ticket_freshdesk_id = %s")
+            params.append(ticket_id)
+        elif max_tickets is not None:
+            filters.append(
+                """
+                ticket_freshdesk_id IN (
+                    SELECT freshdesk_id
+                    FROM tickets
+                    ORDER BY freshdesk_id
+                    LIMIT %s
+                )
+                """
+            )
+            params.append(max_tickets)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT freshdesk_id, ticket_freshdesk_id, attachments
+                FROM ticket_conversations
+                WHERE {" AND ".join(filters)}
+                ORDER BY ticket_freshdesk_id, freshdesk_id
+                """,
+                params,
+            ).fetchall()
+            for row in rows:
+                count += self._upsert_attachment_rows(
+                    conn,
+                    row["freshdesk_id"],
+                    row["ticket_freshdesk_id"],
+                    row["attachments"] or [],
+                )
+        return count
+
+    def iter_inline_image_candidate_ticket_ids(
+        self,
+        ticket_id: int | None = None,
+        limit: int | None = None,
+        max_tickets: int | None = None,
+    ) -> list[int]:
+        filters = [
+            """
+            EXISTS (
+                SELECT 1
+                FROM ticket_conversations c
+                WHERE c.ticket_freshdesk_id = t.freshdesk_id
+                  AND (
+                    c.body_text ILIKE '%%[cid:%%'
+                    OR c.body_html ILIKE '%%<img%%'
+                    OR c.body_html ILIKE '%%attachment.freshdesk.com/inline/attachment%%'
+                  )
+            )
+            """
+        ]
+        params: list[Any] = []
+        if ticket_id is not None:
+            filters.append("t.freshdesk_id = %s")
+            params.append(ticket_id)
+        elif max_tickets is not None:
+            filters.append(
+                """
+                t.freshdesk_id IN (
+                    SELECT freshdesk_id
+                    FROM tickets
+                    ORDER BY freshdesk_id
+                    LIMIT %s
+                )
+                """
+            )
+            params.append(max_tickets)
+        sql = f"""
+            SELECT t.freshdesk_id
+            FROM tickets t
+            WHERE {" AND ".join(filters)}
+            ORDER BY t.freshdesk_id
+        """
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+        with self.connect() as conn:
+            return [int(row["freshdesk_id"]) for row in conn.execute(sql, params).fetchall()]
+
+    def upsert_inline_image_metadata(
+        self,
+        ticket_id: int,
+        images_by_conversation: dict[int, list[dict[str, Any]]],
+    ) -> int:
+        count = 0
+        with self.connect() as conn:
+            for conversation_id, images in images_by_conversation.items():
+                count += self._upsert_attachment_rows(
+                    conn,
+                    conversation_id,
+                    ticket_id,
+                    images,
+                    source="inline_image",
+                )
+        return count
+
+    def iter_attachments_to_download(
+        self,
+        limit: int | None = None,
+        ticket_id: int | None = None,
+        max_tickets: int | None = None,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        filters = ["((remote_url IS NOT NULL AND remote_url <> '') OR source = 'inline_image')"]
+        params: list[Any] = []
+        if not force:
+            filters.append("local_path IS NULL")
+        if ticket_id is not None:
+            filters.append("ticket_freshdesk_id = %s")
+            params.append(ticket_id)
+        elif max_tickets is not None:
+            filters.append(
+                """
+                ticket_freshdesk_id IN (
+                    SELECT freshdesk_id
+                    FROM tickets
+                    ORDER BY freshdesk_id
+                    LIMIT %s
+                )
+                """
+            )
+            params.append(max_tickets)
+        sql = f"""
+            SELECT *
+            FROM ticket_attachments
+            WHERE {" AND ".join(filters)}
+            ORDER BY ticket_freshdesk_id, conversation_freshdesk_id, attachment_index
+        """
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(limit)
+        with self.connect() as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def get_attachment(self, attachment_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM ticket_attachments WHERE id = %s",
+                (attachment_id,),
+            ).fetchone()
+
+    def mark_attachment_downloaded(
+        self,
+        attachment_id: int,
+        local_path: str,
+        local_size_bytes: int,
+        sha256: str,
+        content_type: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ticket_attachments
+                SET local_path = %s,
+                    local_size_bytes = %s,
+                    sha256 = %s,
+                    content_type = COALESCE(%s, content_type),
+                    downloaded_at = now(),
+                    download_error = NULL,
+                    synced_at = now()
+                WHERE id = %s
+                """,
+                (local_path, local_size_bytes, sha256, content_type, attachment_id),
+            )
+
+    def mark_attachment_error(self, attachment_id: int, error: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE ticket_attachments
+                SET download_error = %s,
+                    synced_at = now()
+                WHERE id = %s
+                """,
+                (error[:1000], attachment_id),
+            )
+
+    def get_attachment_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT
+                    count(*) AS attachment_count,
+                    count(*) FILTER (WHERE local_path IS NOT NULL) AS downloaded_count,
+                    count(*) FILTER (WHERE local_path IS NULL AND remote_url IS NOT NULL)
+                        AS pending_count,
+                    count(*) FILTER (WHERE download_error IS NOT NULL) AS error_count,
+                    coalesce(sum(size_bytes), 0) AS remote_size_bytes,
+                    coalesce(sum(local_size_bytes), 0) AS local_size_bytes
+                FROM ticket_attachments
+                """
+            ).fetchone()
+
     def search(
         self,
         query: str | None,
@@ -306,6 +510,26 @@ class Database:
                 """,
                 (freshdesk_id,),
             ).fetchall()
+            attachments = conn.execute(
+                """
+                SELECT *
+                FROM ticket_attachments
+                WHERE ticket_freshdesk_id = %s
+                ORDER BY conversation_freshdesk_id, attachment_index
+                """,
+                (freshdesk_id,),
+            ).fetchall()
+            attachments_by_conversation: dict[int, list[dict[str, Any]]] = {}
+            for attachment in attachments:
+                attachments_by_conversation.setdefault(
+                    attachment["conversation_freshdesk_id"],
+                    [],
+                ).append(attachment)
+            for conversation in conversations:
+                conversation["downloaded_attachments"] = attachments_by_conversation.get(
+                    conversation["freshdesk_id"],
+                    [],
+                )
             return {"ticket": ticket, "conversations": conversations}
 
     def get_filter_options(self) -> dict[str, Any]:
@@ -469,6 +693,87 @@ class Database:
             """,
             _json_params(conversation),
         )
+        self._upsert_attachment_rows(
+            conn,
+            conversation["freshdesk_id"],
+            conversation["ticket_freshdesk_id"],
+            conversation.get("attachments") or [],
+        )
+
+    def _upsert_attachment_rows(
+        self,
+        conn,
+        conversation_id: int,
+        ticket_id: int,
+        attachments: list[dict[str, Any]],
+        source: str = "attachment",
+    ) -> int:
+        seen_indexes = []
+        for index, attachment in enumerate(attachments):
+            attachment_index = _optional_int(attachment.get("attachment_index"))
+            if attachment_index is None:
+                attachment_index = index
+            seen_indexes.append(attachment_index)
+            filename = _attachment_filename(attachment)
+            conn.execute(
+                """
+                INSERT INTO ticket_attachments (
+                    freshdesk_attachment_id, ticket_freshdesk_id,
+                    conversation_freshdesk_id, attachment_index, source, content_id,
+                    filename, content_type, size_bytes, remote_url, metadata,
+                    created_at, updated_at, synced_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, now()
+                )
+                ON CONFLICT (conversation_freshdesk_id, source, attachment_index) DO UPDATE SET
+                    freshdesk_attachment_id = EXCLUDED.freshdesk_attachment_id,
+                    ticket_freshdesk_id = EXCLUDED.ticket_freshdesk_id,
+                    content_id = EXCLUDED.content_id,
+                    filename = EXCLUDED.filename,
+                    content_type = EXCLUDED.content_type,
+                    size_bytes = EXCLUDED.size_bytes,
+                    remote_url = EXCLUDED.remote_url,
+                    metadata = EXCLUDED.metadata,
+                    created_at = EXCLUDED.created_at,
+                    updated_at = EXCLUDED.updated_at,
+                    synced_at = now()
+                """,
+                (
+                    _optional_int(attachment.get("id")),
+                    ticket_id,
+                    conversation_id,
+                    attachment_index,
+                    source,
+                    attachment.get("content_id"),
+                    filename,
+                    attachment.get("content_type"),
+                    _optional_int(attachment.get("size") or attachment.get("file_size")),
+                    attachment.get("safe_remote_url")
+                    or attachment.get("attachment_url")
+                    or attachment.get("url"),
+                    json.dumps(attachment),
+                    attachment.get("created_at"),
+                    attachment.get("updated_at"),
+                ),
+            )
+
+        if seen_indexes:
+            conn.execute(
+                """
+                DELETE FROM ticket_attachments
+                WHERE conversation_freshdesk_id = %s
+                  AND source = %s
+                  AND attachment_index <> ALL(%s)
+                """,
+                (conversation_id, source, seen_indexes),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM ticket_attachments WHERE conversation_freshdesk_id = %s AND source = %s",
+                (conversation_id, source),
+            )
+        return len(attachments)
 
 
 def _json_params(values: dict[str, Any]) -> dict[str, Any]:
@@ -483,3 +788,17 @@ def _json_params(values: dict[str, Any]) -> dict[str, Any]:
         key: json.dumps(value) if key in json_keys else value
         for key, value in values.items()
     }
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _attachment_filename(attachment: dict[str, Any]) -> str:
+    filename = str(attachment.get("name") or attachment.get("filename") or "attachment").strip()
+    return filename or "attachment"

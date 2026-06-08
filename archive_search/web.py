@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import mimetypes
+import re
 from datetime import date, datetime
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
+from .attachments import DEFAULT_ATTACHMENT_DIR, safe_filename
 from .db import Database
 from .typesense_search import TypesenseClient, TypesenseError
 
@@ -28,16 +31,23 @@ PRIORITY_LABELS = {
     3: "High",
     4: "Urgent",
 }
+CID_RE = re.compile(r"\[cid:([^\]]+)\]", re.IGNORECASE)
+IMAGE_REMOVED_RE = re.compile(r"\[?Image removed by sender\]?", re.IGNORECASE)
+INLINE_PLACEHOLDER_RE = re.compile(
+    r"\[cid:([^\]]+)\]|\[?Image removed by sender\]?",
+    re.IGNORECASE,
+)
 
 
 def run_server(
     database: Database,
     typesense: TypesenseClient | None = None,
     default_backend: str = "postgres",
+    attachment_root: Path | str = DEFAULT_ATTACHMENT_DIR,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    handler = make_handler(database, typesense, default_backend)
+    handler = make_handler(database, typesense, default_backend, attachment_root)
     server = ThreadingHTTPServer((host, port), handler)
     print(f"Freshdesk archive web UI running at http://{host}:{port}")
     try:
@@ -52,7 +62,10 @@ def make_handler(
     database: Database,
     typesense: TypesenseClient | None = None,
     default_backend: str = "postgres",
+    attachment_root: Path | str = DEFAULT_ATTACHMENT_DIR,
 ):
+    resolved_attachment_root = Path(attachment_root).expanduser().resolve()
+
     class ArchiveHandler(BaseHTTPRequestHandler):
         server_version = "FreshdeskArchiveWeb/0.1"
 
@@ -66,6 +79,10 @@ def make_handler(
             if parsed.path.startswith("/ticket/"):
                 ticket_id = parsed.path.removeprefix("/ticket/").strip("/")
                 self._send_html(render_ticket_page(database, ticket_id, parsed.query))
+                return
+            if parsed.path.startswith("/attachments/"):
+                attachment_id = parsed.path.removeprefix("/attachments/").strip("/")
+                self._send_attachment(attachment_id, parsed.query)
                 return
             if parsed.path == "/static/app.css":
                 self._send_static("app.css", "text/css; charset=utf-8")
@@ -82,6 +99,44 @@ def make_handler(
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _send_attachment(self, attachment_id: str, raw_query: str = "") -> None:
+            if not attachment_id.isdigit():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            attachment = database.get_attachment(int(attachment_id))
+            if not attachment or not attachment.get("local_path"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            path = (resolved_attachment_root / attachment["local_path"]).resolve()
+            if not path.is_relative_to(resolved_attachment_root) or not path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            content_type = (
+                attachment.get("content_type")
+                or mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream"
+            )
+            filename = str(attachment.get("filename") or path.name)
+            fallback = safe_filename(filename).encode("ascii", errors="ignore").decode("ascii")
+            if not fallback:
+                fallback = "attachment"
+            encoded_name = quote(filename)
+            disposition = "inline" if _first(parse_qs(raw_query), "inline") == "1" else "attachment"
+
+            with path.open("rb") as handle:
+                payload = handle.read()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header(
+                "Content-Disposition",
+                f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded_name}',
+            )
+            self.end_headers()
+            self.wfile.write(payload)
 
         def _send_static(self, filename: str, content_type: str) -> None:
             path = STATIC_DIR / filename
@@ -108,9 +163,10 @@ def render_search_page(
     error = ""
     found = None
     search_ms = None
-    if params["backend"] == "typesense" and typesense is not None:
+    if params["backend"] in {"typesense", "hybrid"} and typesense is not None:
         try:
-            result = typesense.search(
+            search_method = typesense.hybrid_search if params["backend"] == "hybrid" else typesense.search
+            result = search_method(
                 params["query"] or None,
                 limit=params["limit"],
                 product=params["product"] or None,
@@ -131,7 +187,7 @@ def render_search_page(
             error = f"Typesense unavailable; showing Postgres results. {exc}"
     else:
         rows = _postgres_search(database, params)
-        if params["backend"] == "typesense":
+        if params["backend"] in {"typesense", "hybrid"}:
             error = "Typesense is not configured; showing Postgres results."
             params["backend"] = "postgres"
 
@@ -223,6 +279,7 @@ def render_search_form(params: dict[str, Any], options: dict[str, Any]) -> str:
         <label>
           <span>Engine</span>
           <select name="backend">
+            <option value="hybrid" {_selected("hybrid", params["backend"])}>Hybrid RRF</option>
             <option value="typesense" {_selected("typesense", params["backend"])}>Typesense</option>
             <option value="postgres" {_selected("postgres", params["backend"])}>Postgres FTS</option>
           </select>
@@ -294,6 +351,7 @@ def render_results(rows: list[dict[str, Any]], raw_query: str) -> str:
                 <span>{_status(row.get("status"))}</span>
                 <span>{_priority(row.get("priority"))}</span>
                 <span>{_date(row.get("updated_at"))}</span>
+                {render_match_source(row)}
               </div>
               <h3><a href="{href}">{_text(row.get("subject") or "(no subject)")}</a></h3>
               <div class="result-meta">
@@ -305,6 +363,13 @@ def render_results(rows: list[dict[str, Any]], raw_query: str) -> str:
             """
         )
     return "\n".join(rendered)
+
+
+def render_match_source(row: dict[str, Any]) -> str:
+    source = row.get("match_source")
+    if not source:
+        return ""
+    return f'<span class="source-pill">{_text(source)}</span>'
 
 
 def render_ticket_facts(ticket: dict[str, Any]) -> str:
@@ -334,7 +399,10 @@ def render_conversations(conversations: list[dict[str, Any]]) -> str:
     for conversation in conversations:
         visibility = "Private note" if conversation.get("private") else "Public"
         direction = "Incoming" if conversation.get("incoming") else "Outgoing"
-        attachments = render_attachments(conversation.get("attachments") or [])
+        attachments = render_attachments(
+            conversation.get("downloaded_attachments") or [],
+            conversation.get("attachments") or [],
+        )
         rendered.append(
             f"""
             <article class="conversation">
@@ -343,7 +411,7 @@ def render_conversations(conversations: list[dict[str, Any]]) -> str:
                 <span class="badge">{visibility}</span>
                 <span class="badge">{direction}</span>
               </div>
-              <div class="body-text">{_multiline(conversation.get("body_text") or "(empty)")}</div>
+              <div class="body-text">{render_body_text(conversation.get("body_text") or "(empty)", conversation.get("downloaded_attachments") or [])}</div>
               {attachments}
             </article>
             """
@@ -351,26 +419,174 @@ def render_conversations(conversations: list[dict[str, Any]]) -> str:
     return "\n".join(rendered)
 
 
-def render_attachments(attachments: list[dict[str, Any]]) -> str:
-    if not attachments:
+def render_body_text(value: Any, attachments: list[dict[str, Any]]) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+
+    rendered = []
+    last = 0
+    used_attachment_ids: set[int] = set()
+    for match in INLINE_PLACEHOLDER_RE.finditer(text):
+        rendered.append(_multiline(text[last : match.start()]))
+        attachment = _find_inline_image(
+            cid_value=match.group(1),
+            attachments=attachments,
+            used_attachment_ids=used_attachment_ids,
+        )
+        if attachment:
+            used_attachment_ids.add(int(attachment["id"]))
+            rendered.append(render_inline_image(attachment))
+        else:
+            label = (
+                "image removed by sender"
+                if IMAGE_REMOVED_RE.fullmatch(match.group(0))
+                else "image not available"
+            )
+            rendered.append(
+                f'<span class="cid-placeholder">{_text(match.group(0))}</span>'
+                f'<span class="cid-missing">{label}</span>'
+            )
+        last = match.end()
+    rendered.append(_multiline(text[last:]))
+    return "".join(rendered)
+
+
+def _find_inline_image(
+    cid_value: str | None,
+    attachments: list[dict[str, Any]],
+    used_attachment_ids: set[int] | None = None,
+) -> dict[str, Any] | None:
+    used_attachment_ids = used_attachment_ids or set()
+    cid_filename = _cid_filename(cid_value) if cid_value else ""
+    image_attachments = [
+        attachment
+        for attachment in attachments
+        if _is_downloaded_image(attachment) and int(attachment["id"]) not in used_attachment_ids
+    ]
+    if cid_filename:
+        for attachment in image_attachments:
+            if str(attachment.get("filename") or "").lower() == cid_filename:
+                return attachment
+    inline_images = [
+        attachment
+        for attachment in image_attachments
+        if attachment.get("source") == "inline_image"
+    ]
+    if inline_images:
+        return inline_images[0]
+    if len(image_attachments) == 1:
+        return image_attachments[0]
+    return None
+
+
+def _cid_filename(cid_value: str | None) -> str:
+    if not cid_value:
+        return ""
+    value = cid_value.strip().strip("<>")
+    if "@" in value:
+        value = value.split("@", 1)[0]
+    return value.lower()
+
+
+def render_inline_image(attachment: dict[str, Any]) -> str:
+    attachment_id = attachment["id"]
+    filename = _text(_attachment_display_name(attachment, fallback="inline image"))
+    return f"""
+    <figure class="inline-image">
+      <a href="/attachments/{attachment_id}">
+        <img src="/attachments/{attachment_id}?inline=1" alt="{filename}">
+      </a>
+      <figcaption>{filename}</figcaption>
+    </figure>
+    """
+
+
+def render_attachments(
+    downloaded_attachments: list[dict[str, Any]],
+    legacy_attachments: list[dict[str, Any]],
+) -> str:
+    if not downloaded_attachments and not legacy_attachments:
         return ""
     rows = []
-    for attachment in attachments:
-        rows.append(
-            f"""
-            <li>
-              <span>{_text(attachment.get("name") or "attachment")}</span>
-              <span>{_text(attachment.get("content_type") or "unknown")}</span>
-              <span>{_file_size(attachment.get("size"))}</span>
-            </li>
-            """
-        )
+    previews = render_image_previews(downloaded_attachments)
+    if downloaded_attachments:
+        for attachment in downloaded_attachments:
+            name = _text(_attachment_display_name(attachment))
+            if attachment.get("local_path"):
+                name_html = f'<a href="/attachments/{attachment["id"]}">{name}</a>'
+            else:
+                name_html = f"<span>{name}</span>"
+            rows.append(
+                f"""
+                <li>
+                  <span>{name_html}</span>
+                  <span>{_text(attachment.get("content_type") or "unknown")}</span>
+                  <span>{_file_size(attachment.get("local_size_bytes") or attachment.get("size_bytes"))}</span>
+                  <span>{_attachment_status(attachment)}</span>
+                </li>
+                """
+            )
+    else:
+        for attachment in legacy_attachments:
+            rows.append(
+                f"""
+                <li>
+                  <span>{_text(attachment.get("name") or "attachment")}</span>
+                  <span>{_text(attachment.get("content_type") or "unknown")}</span>
+                  <span>{_file_size(attachment.get("size"))}</span>
+                  <span>Not indexed</span>
+                </li>
+                """
+            )
     return f"""
     <div class="attachments">
       <h4>Attachments</h4>
+      {previews}
       <ul>{''.join(rows)}</ul>
     </div>
     """
+
+
+def render_image_previews(attachments: list[dict[str, Any]]) -> str:
+    images = [attachment for attachment in attachments if _is_downloaded_image(attachment)]
+    if not images:
+        return ""
+    items = []
+    for attachment in images:
+        attachment_id = attachment["id"]
+        filename = _text(_attachment_display_name(attachment, fallback="inline image"))
+        items.append(
+            f"""
+            <a class="attachment-preview" href="/attachments/{attachment_id}">
+              <img src="/attachments/{attachment_id}?inline=1" alt="{filename}">
+              <span>{filename}</span>
+            </a>
+            """
+        )
+    return f'<div class="attachment-previews">{"".join(items)}</div>'
+
+
+def _is_downloaded_image(attachment: dict[str, Any]) -> bool:
+    return bool(
+        attachment.get("local_path")
+        and str(attachment.get("content_type") or "").lower().startswith("image/")
+    )
+
+
+def _attachment_display_name(attachment: dict[str, Any], fallback: str = "attachment") -> str:
+    filename = str(attachment.get("filename") or "").strip()
+    if filename.lower() == "image removed by sender":
+        return "inline image"
+    return filename or fallback
+
+
+def _attachment_status(attachment: dict[str, Any]) -> str:
+    if attachment.get("local_path"):
+        return "Downloaded"
+    if attachment.get("download_error"):
+        return "Error"
+    return "Pending"
 
 
 def render_options(rows: list[dict[str, Any]], selected: str) -> str:
@@ -422,7 +638,7 @@ def _layout(title: str, body: str) -> str:
 def _search_params(raw_query: str, default_backend: str = "postgres") -> dict[str, Any]:
     params = parse_qs(raw_query)
     backend = _first(params, "backend") or default_backend
-    if backend not in {"postgres", "typesense"}:
+    if backend not in {"postgres", "typesense", "hybrid"}:
         backend = "postgres"
     return {
         "backend": backend,
