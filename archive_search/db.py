@@ -296,7 +296,21 @@ class Database:
     ) -> int:
         count = 0
         with self.connect() as conn:
+            existing_conversation_ids = {
+                int(row["freshdesk_id"])
+                for row in conn.execute(
+                    """
+                    SELECT freshdesk_id
+                    FROM ticket_conversations
+                    WHERE ticket_freshdesk_id = %s
+                      AND freshdesk_id = ANY(%s)
+                    """,
+                    (ticket_id, list(images_by_conversation)),
+                ).fetchall()
+            }
             for conversation_id, images in images_by_conversation.items():
+                if conversation_id not in existing_conversation_ids:
+                    continue
                 count += self._upsert_attachment_rows(
                     conn,
                     conversation_id,
