@@ -44,6 +44,9 @@ class FakeDatabase:
     def upsert_ticket_with_conversations(self, ticket, conversations):
         self.upserts.append((ticket, conversations))
 
+    def refresh_search_documents(self):
+        self.refreshed = True
+
     def mark_sync_success(self, last_updated_at, ticket_count, conversation_count):
         self.success = (last_updated_at, ticket_count, conversation_count)
 

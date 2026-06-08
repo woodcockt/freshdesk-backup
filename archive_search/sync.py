@@ -66,6 +66,8 @@ class SyncService:
                 if max_tickets is not None and result.tickets >= max_tickets:
                     break
 
+            if result.tickets:
+                self.database.refresh_search_documents()
             self.database.mark_sync_success(
                 result.last_updated_at,
                 result.tickets,

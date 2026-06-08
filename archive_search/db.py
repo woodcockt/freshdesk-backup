@@ -47,6 +47,41 @@ class Database:
                 conn.execute(path.read_text(encoding="utf-8"))
                 conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
 
+    def refresh_search_documents(self) -> None:
+        with self.connect() as conn:
+            conn.execute("REFRESH MATERIALIZED VIEW ticket_search_documents")
+
+    def iter_typesense_documents(self, batch_size: int = 500):
+        sql = """
+            SELECT
+                d.freshdesk_id,
+                d.subject,
+                d.description_text,
+                d.product_label,
+                d.tags,
+                d.status,
+                d.priority,
+                d.created_at,
+                d.updated_at,
+                d.search_text,
+                COALESCE(a.attachment_count, 0) AS attachment_count
+            FROM ticket_search_documents d
+            LEFT JOIN (
+                SELECT ticket_freshdesk_id, SUM(attachment_count)::integer AS attachment_count
+                FROM ticket_conversations
+                GROUP BY ticket_freshdesk_id
+            ) a ON a.ticket_freshdesk_id = d.freshdesk_id
+            ORDER BY d.freshdesk_id
+        """
+        with self.connect() as conn:
+            with conn.cursor(name="typesense_documents") as cur:
+                cur.execute(sql)
+                while True:
+                    rows = cur.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    yield rows
+
     def upsert_ticket_fields(self, fields: list[dict[str, Any]]) -> None:
         with self.connect() as conn:
             with conn.cursor() as cur:
@@ -272,6 +307,63 @@ class Database:
                 (freshdesk_id,),
             ).fetchall()
             return {"ticket": ticket, "conversations": conversations}
+
+    def get_filter_options(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            products = conn.execute(
+                """
+                SELECT product_label AS value, count(*) AS count
+                FROM tickets
+                WHERE product_label IS NOT NULL AND product_label <> ''
+                GROUP BY product_label
+                ORDER BY count DESC, product_label ASC
+                LIMIT 100
+                """
+            ).fetchall()
+            tags = conn.execute(
+                """
+                SELECT tag AS value, count(*) AS count
+                FROM tickets, unnest(tags) AS tag
+                WHERE tag <> ''
+                GROUP BY tag
+                ORDER BY count DESC, tag ASC
+                LIMIT 100
+                """
+            ).fetchall()
+            status_counts = conn.execute(
+                """
+                SELECT status AS value, count(*) AS count
+                FROM tickets
+                WHERE status IS NOT NULL
+                GROUP BY status
+                ORDER BY status ASC
+                """
+            ).fetchall()
+            priority_counts = conn.execute(
+                """
+                SELECT priority AS value, count(*) AS count
+                FROM tickets
+                WHERE priority IS NOT NULL
+                GROUP BY priority
+                ORDER BY priority ASC
+                """
+            ).fetchall()
+            summary = conn.execute(
+                """
+                SELECT
+                    (SELECT count(*) FROM tickets) AS ticket_count,
+                    (SELECT count(*) FROM ticket_conversations) AS conversation_count,
+                    (SELECT coalesce(sum(attachment_count), 0) FROM ticket_conversations)
+                        AS attachment_count
+                """
+            ).fetchone()
+            return {
+                "products": products,
+                "tags": tags,
+                "statuses": status_counts,
+                "priorities": priority_counts,
+                "summary": summary,
+            }
 
     def _upsert_ticket(self, conn, ticket: dict[str, Any]) -> None:
         conn.execute(

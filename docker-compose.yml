@@ -12,5 +12,19 @@ services:
     volumes:
       - freshdesk_archive_pgdata:/var/lib/postgresql/data
 
+  typesense:
+    image: typesense/typesense:30.2
+    container_name: freshdesk-archive-typesense
+    restart: unless-stopped
+    command: >
+      --data-dir /data
+      --api-key=${TYPESENSE_API_KEY:-xyz}
+      --enable-cors
+    ports:
+      - "${TYPESENSE_PORT:-8108}:8108"
+    volumes:
+      - freshdesk_archive_typesense_data:/data
+
 volumes:
   freshdesk_archive_pgdata:
+  freshdesk_archive_typesense_data:

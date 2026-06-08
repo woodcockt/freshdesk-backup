@@ -31,6 +31,10 @@ class Settings:
     pii_hash_secret: str
     sync_start: str = "2015-01-01T00:00:00Z"
     freshdesk_per_page: int = 100
+    typesense_url: str = "http://127.0.0.1:8108"
+    typesense_api_key: str = ""
+    typesense_collection: str = "freshdesk_tickets"
+    search_backend: str = "postgres"
 
 
 def get_settings() -> Settings:
@@ -44,6 +48,10 @@ def get_settings() -> Settings:
     pii_hash_secret = os.environ.get("PII_HASH_SECRET", "").strip()
     sync_start = os.environ.get("FRESHDESK_SYNC_START", "2015-01-01T00:00:00Z").strip()
     per_page = int(os.environ.get("FRESHDESK_PER_PAGE", "100"))
+    typesense_url = os.environ.get("TYPESENSE_URL", "http://127.0.0.1:8108").strip()
+    typesense_api_key = os.environ.get("TYPESENSE_API_KEY", "").strip()
+    typesense_collection = os.environ.get("TYPESENSE_COLLECTION", "freshdesk_tickets").strip()
+    search_backend = os.environ.get("SEARCH_BACKEND", "postgres").strip().lower()
 
     missing = []
     if not domain:
@@ -63,10 +71,13 @@ def get_settings() -> Settings:
         pii_hash_secret=pii_hash_secret,
         sync_start=sync_start,
         freshdesk_per_page=per_page,
+        typesense_url=typesense_url,
+        typesense_api_key=typesense_api_key,
+        typesense_collection=typesense_collection,
+        search_backend=search_backend if search_backend in {"postgres", "typesense"} else "postgres",
     )
 
 
 def normalize_domain(domain: str) -> str:
     normalized = domain.removeprefix("https://").removeprefix("http://").rstrip("/")
     return normalized
-
